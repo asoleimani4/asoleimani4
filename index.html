@@ -1,0 +1,429 @@
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+  <title>شمارش تصویری</title>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <style>
+    :root {
+      --bg: #0b1020;
+      --glass: rgba(18, 24, 42, 0.62);
+      --glass-border: rgba(255, 255, 255, 0.16);
+      --text: #f4f7ff;
+      --muted: #b7c0d8;
+      --accent: #6ea8ff;
+      --accent-2: #8b7cff;
+      --ok: #3ecf8e;
+      --danger: #ff6b7a;
+      --dock-h: 88px;
+      --safe-b: env(safe-area-inset-bottom, 0px);
+      --safe-t: env(safe-area-inset-top, 0px);
+    }
+
+    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    html, body { margin: 0; height: 100%; overflow: hidden; background: var(--bg); color: var(--text);
+      font-family: "SF Pro Text", "Vazirmatn", "IRANSans", system-ui, sans-serif; }
+
+    body {
+      background:
+        radial-gradient(1200px 600px at 10% -10%, rgba(110, 168, 255, 0.18), transparent 50%),
+        radial-gradient(900px 500px at 110% 10%, rgba(139, 124, 255, 0.16), transparent 46%),
+        var(--bg);
+    }
+
+    #stage { position: fixed; inset: 0; }
+    #canvas { width: 100%; height: 100%; display: block; touch-action: none; }
+
+    .empty {
+      position: absolute; inset: 0;
+      display: flex; align-items: center; justify-content: center;
+      padding: calc(24px + var(--safe-t)) 28px calc(var(--dock-h) + var(--safe-b) + 24px);
+      text-align: center; color: var(--muted);
+    }
+    .empty h1 { margin: 0 0 8px; font-size: 22px; font-weight: 650; color: var(--text); }
+    .empty p { margin: 0; line-height: 1.7; font-size: 14px; }
+
+    .dock {
+      position: fixed; left: 12px; right: 12px;
+      bottom: calc(10px + var(--safe-b));
+      z-index: 20;
+      padding: 10px;
+      border-radius: 22px;
+      background: var(--glass);
+      border: 1px solid var(--glass-border);
+      backdrop-filter: blur(22px) saturate(1.4);
+      -webkit-backdrop-filter: blur(22px) saturate(1.4);
+      box-shadow: 0 12px 40px rgba(0, 0, 0, 0.35);
+    }
+
+    .row { display: flex; gap: 8px; }
+    .col { display: flex; flex-direction: column; gap: 8px; }
+
+    button {
+      appearance: none; border: 0; cursor: pointer;
+      color: var(--text); background: rgba(255,255,255,0.08);
+      border: 1px solid rgba(255,255,255,0.1);
+      border-radius: 16px; min-height: 48px; padding: 0 14px;
+      font: inherit; font-size: 14px; font-weight: 600;
+    }
+    button.primary {
+      background: linear-gradient(135deg, var(--accent), var(--accent-2));
+      border-color: transparent; flex: 1;
+    }
+    button.ghost { background: rgba(255,255,255,0.06); flex: 1; }
+    button.ok { background: linear-gradient(135deg, #2bb673, #3ecf8e); border-color: transparent; flex: 1; }
+    button.warn { color: #ffd7dc; background: rgba(255,107,122,0.12); border-color: rgba(255,107,122,0.25); }
+    button:disabled { opacity: 0.38; cursor: not-allowed; }
+    .hint { padding: 2px 6px 6px; font-size: 12px; color: var(--muted); text-align: center; }
+
+    .toast {
+      position: fixed; left: 16px; right: 16px; top: calc(14px + var(--safe-t));
+      z-index: 30; padding: 12px 14px; border-radius: 14px;
+      background: rgba(12,16,28,0.82); border: 1px solid var(--glass-border);
+      backdrop-filter: blur(16px); font-size: 13px; display: none;
+    }
+    .toast.show { display: block; }
+
+    input[type="file"] { display: none; }
+  </style>
+</head>
+<body>
+  <div id="stage">
+    <canvas id="canvas"></canvas>
+    <div id="empty" class="empty">
+      <div>
+        <h1>شمارش اشیاء</h1>
+        <p>یک تصویر بفرستید، یک تا پنج کادر نمونه بکشید، سپس شمارش را اجرا کنید.</p>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast"></div>
+
+  <div class="dock" id="dock"></div>
+
+  <input id="cameraInput" type="file" accept="image/*" capture="environment" />
+  <input id="galleryInput" type="file" accept="image/*" />
+
+  <script>
+    const tg = window.Telegram && window.Telegram.WebApp;
+    if (tg) {
+      tg.ready();
+      tg.expand();
+      try { tg.disableVerticalSwipes && tg.disableVerticalSwipes(); } catch (e) {}
+    }
+
+    const MAX_BOXES = 5;
+    const API_URL = (window.COUNT_API_URL || "/count");
+
+    const canvas = document.getElementById("canvas");
+    const ctx = canvas.getContext("2d");
+    const empty = document.getElementById("empty");
+    const dock = document.getElementById("dock");
+    const toast = document.getElementById("toast");
+    const cameraInput = document.getElementById("cameraInput");
+    const galleryInput = document.getElementById("galleryInput");
+
+    const state = {
+      screen: "home",          // home | pick | annotate | busy | result
+      image: null,
+      boxes: [],               // {ymin,xmin,ymax,xmax} normalized
+      drawing: false,
+      draft: null,
+      count: null,
+      message: ""
+    };
+
+    let view = { scale: 1, ox: 0, oy: 0, iw: 0, ih: 0 };
+
+    function showToast(text) {
+      toast.textContent = text;
+      toast.classList.add("show");
+      clearTimeout(showToast._t);
+      showToast._t = setTimeout(() => toast.classList.remove("show"), 2600);
+    }
+
+    function renderDock() {
+      if (state.screen === "home") {
+        dock.innerHTML = `
+          <div class="row">
+            <button class="primary" id="btnSend">ارسال تصویر</button>
+          </div>`;
+        document.getElementById("btnSend").onclick = () => {
+          state.screen = "pick";
+          renderDock();
+        };
+        return;
+      }
+
+      if (state.screen === "pick") {
+        dock.innerHTML = `
+          <div class="col">
+            <div class="row">
+              <button class="primary" id="btnCamera">گرفتن تصویر با دوربین</button>
+              <button class="ghost" id="btnGallery">فراخوانی تصویر از دستگاه</button>
+            </div>
+            <button class="warn" id="btnRestart">شروع مجدد</button>
+          </div>`;
+        document.getElementById("btnCamera").onclick = () => cameraInput.click();
+        document.getElementById("btnGallery").onclick = () => galleryInput.click();
+        document.getElementById("btnRestart").onclick = restart;
+        return;
+      }
+
+      const n = state.boxes.length;
+      const canAdd = n < MAX_BOXES && state.screen === "annotate";
+      const canCount = n >= 1 && state.screen === "annotate";
+      const result = state.screen === "result"
+        ? `<div class="hint">نتیجه شمارش: <b style="color:#fff">${state.count ?? "—"}</b></div>`
+        : `<div class="hint">${n} از ${MAX_BOXES} کادر نمونه — مختصات نرمال [ymin, xmin, ymax, xmax]</div>`;
+
+      dock.innerHTML = `
+        ${result}
+        <div class="row">
+          <button class="ghost" id="btnBox" ${canAdd ? "" : "disabled"}>انتخاب کادر نمونه</button>
+          <button class="ok" id="btnCount" ${canCount ? "" : "disabled"}>اجرای شمارش</button>
+        </div>
+        <div style="height:8px"></div>
+        <button class="warn" id="btnRestart">شروع مجدد</button>`;
+
+      document.getElementById("btnBox").onclick = () => {
+        if (!canAdd) return;
+        state.drawing = true;
+        showToast("روی تصویر بکشید تا کادر نمونه رسم شود");
+      };
+      document.getElementById("btnCount").onclick = executeCount;
+      document.getElementById("btnRestart").onclick = restart;
+    }
+
+    function restart() {
+      state.screen = "home";
+      state.image = null;
+      state.boxes = [];
+      state.drawing = false;
+      state.draft = null;
+      state.count = null;
+      empty.style.display = "flex";
+      draw();
+      renderDock();
+    }
+
+    function fitCanvas() {
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+      canvas.width = Math.round(w * dpr);
+      canvas.height = Math.round(h * dpr);
+      canvas.style.width = w + "px";
+      canvas.style.height = h + "px";
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    }
+
+    function layoutImage() {
+      if (!state.image) return;
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+      const iw = state.image.width;
+      const ih = state.image.height;
+      const scale = Math.min(w / iw, h / ih);
+      view = {
+        scale,
+        ox: (w - iw * scale) / 2,
+        oy: (h - ih * scale) / 2,
+        iw, ih
+      };
+    }
+
+    function drawBox(box, idx, draft) {
+      const x = view.ox + box.xmin * view.iw * view.scale;
+      const y = view.oy + box.ymin * view.ih * view.scale;
+      const w = (box.xmax - box.xmin) * view.iw * view.scale;
+      const h = (box.ymax - box.ymin) * view.ih * view.scale;
+      ctx.strokeStyle = draft ? "rgba(255,220,120,0.95)" : "rgba(110,168,255,0.95)";
+      ctx.lineWidth = 2;
+      ctx.setLineDash(draft ? [6, 4] : []);
+      ctx.strokeRect(x, y, w, h);
+      ctx.setLineDash([]);
+      ctx.fillStyle = draft ? "rgba(255,220,120,0.16)" : "rgba(110,168,255,0.16)";
+      ctx.fillRect(x, y, w, h);
+      if (!draft) {
+        ctx.fillStyle = "rgba(110,168,255,0.95)";
+        ctx.fillRect(x, y - 18, 22, 18);
+        ctx.fillStyle = "#081018";
+        ctx.font = "12px sans-serif";
+        ctx.textAlign = "center";
+        ctx.fillText(String(idx + 1), x + 11, y - 5);
+      }
+    }
+
+    function draw() {
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+      ctx.clearRect(0, 0, w, h);
+      if (!state.image) return;
+      ctx.drawImage(state.image, view.ox, view.oy, view.iw * view.scale, view.ih * view.scale);
+      state.boxes.forEach((b, i) => drawBox(b, i, false));
+      if (state.draft) drawBox(state.draft, state.boxes.length, true);
+    }
+
+    function eventToNorm(e) {
+      const rect = canvas.getBoundingClientRect();
+      const t = e.touches ? e.touches[0] : e;
+      const px = t.clientX - rect.left;
+      const py = t.clientY - rect.top;
+      const x = (px - view.ox) / (view.iw * view.scale);
+      const y = (py - view.oy) / (view.ih * view.scale);
+      return {
+        x: Math.min(1, Math.max(0, x)),
+        y: Math.min(1, Math.max(0, y))
+      };
+    }
+
+    function normalizeDraft(a, b) {
+      return {
+        ymin: Math.min(a.y, b.y),
+        xmin: Math.min(a.x, b.x),
+        ymax: Math.max(a.y, b.y),
+        xmax: Math.max(a.x, b.x)
+      };
+    }
+
+    let origin = null;
+
+    function onStart(e) {
+      if (!state.drawing || !state.image || state.boxes.length >= MAX_BOXES) return;
+      e.preventDefault();
+      origin = eventToNorm(e);
+      state.draft = { ymin: origin.y, xmin: origin.x, ymax: origin.y, xmax: origin.x };
+      draw();
+    }
+
+    function onMove(e) {
+      if (!origin || !state.draft) return;
+      e.preventDefault();
+      state.draft = normalizeDraft(origin, eventToNorm(e));
+      draw();
+    }
+
+    function onEnd(e) {
+      if (!origin || !state.draft) return;
+      e.preventDefault();
+      const box = state.draft;
+      const tooSmall = (box.ymax - box.ymin) < 0.01 || (box.xmax - box.xmin) < 0.01;
+      if (!tooSmall && state.boxes.length < MAX_BOXES) state.boxes.push(box);
+      state.draft = null;
+      state.drawing = false;
+      origin = null;
+      draw();
+      renderDock();
+    }
+
+    canvas.addEventListener("mousedown", onStart);
+    canvas.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onEnd);
+    canvas.addEventListener("touchstart", onStart, { passive: false });
+    canvas.addEventListener("touchmove", onMove, { passive: false });
+    canvas.addEventListener("touchend", onEnd, { passive: false });
+
+    function loadFile(file) {
+      if (!file || !file.type.startsWith("image/")) {
+        showToast("فقط فایل تصویر پذیرفته می‌شود");
+        return;
+      }
+      const url = URL.createObjectURL(file);
+      const img = new Image();
+      img.onload = () => {
+        URL.revokeObjectURL(url);
+        state.image = img;
+        state.boxes = [];
+        state.count = null;
+        state.screen = "annotate";
+        empty.style.display = "none";
+        layoutImage();
+        draw();
+        renderDock();
+      };
+      img.onerror = () => showToast("خواندن تصویر ممکن نشد");
+      img.src = url;
+    }
+
+    cameraInput.addEventListener("change", (e) => {
+      loadFile(e.target.files[0]);
+      e.target.value = "";
+    });
+    galleryInput.addEventListener("change", (e) => {
+      loadFile(e.target.files[0]);
+      e.target.value = "";
+    });
+
+    function canvasToBlob() {
+      return new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.92));
+    }
+
+    async function sourceBlob() {
+      // Send the original image, not the annotated canvas
+      const c = document.createElement("canvas");
+      c.width = state.image.width;
+      c.height = state.image.height;
+      c.getContext("2d").drawImage(state.image, 0, 0);
+      return new Promise((resolve) => c.toBlob(resolve, "image/jpeg", 0.92));
+    }
+
+    async function blobToBase64(blob) {
+      const buf = await blob.arrayBuffer();
+      let binary = "";
+      const bytes = new Uint8Array(buf);
+      const chunk = 0x8000;
+      for (let i = 0; i < bytes.length; i += chunk) {
+        binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
+      }
+      return btoa(binary);
+    }
+
+    async function executeCount() {
+      if (state.boxes.length < 1) return;
+      state.screen = "busy";
+      renderDock();
+      showToast("در حال ارسال برای شمارش…");
+      try {
+        const blob = await sourceBlob();
+        const payload = {
+          model: "geco2",
+          boxes: state.boxes.map((b) => [b.ymin, b.xmin, b.ymax, b.xmax]),
+          image_base64: await blobToBase64(blob),
+          mime: "image/jpeg"
+        };
+        const form = new FormData();
+        form.append("image", blob, "sample.jpg");
+        form.append("boxes", JSON.stringify(payload.boxes));
+        form.append("model", "geco2");
+        form.append("image_base64", payload.image_base64);
+
+        const res = await fetch(API_URL, {
+          method: "POST",
+          body: form
+        });
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        const data = await res.json();
+        state.count = data.count;
+        state.screen = "result";
+        showToast("شمارش انجام شد");
+      } catch (err) {
+        state.screen = "annotate";
+        showToast("ارسال شمارش ناموفق بود");
+      }
+      renderDock();
+    }
+
+    window.addEventListener("resize", () => {
+      fitCanvas();
+      layoutImage();
+      draw();
+    });
+
+    fitCanvas();
+    renderDock();
+  </script>
+</body>
+</html>
